@@ -3,6 +3,11 @@
 Objective 1: the stamped 400×400 file decodes by itself.
 Objective 3: brightness, color, JPEG, and a small border crop still decode.
 The finder for a stamp sitting inside a larger canvas is a separate training run.
+
+The message is learned first, on the undamaged stamp. Blur, color, JPEG, crop,
+perspective, and the image penalties (YUV, LPIPS, critic) stay off until both
+`no_im_loss_steps` have passed and smoothed bit accuracy has reached
+`bit_acc_goal`. A low bit accuracy keeps those penalties off.
 """
 
 import csv
@@ -35,8 +40,11 @@ class TrainConfig:
     save_every: int = 5000
     num_workers: int = 2
 
-    # scripts/base.sh
-    no_im_loss_steps: int = 1500
+    # Earliest step at which image penalties may turn on. They wait longer
+    # when smoothed bit accuracy is still below bit_acc_goal.
+    # Ramp lengths below are steps after penalties actually start, not from 0.
+    no_im_loss_steps: int = 5000
+    bit_acc_goal: float = 0.90
     l2_scale: float = 2.0
     l2_ramp: int = 15000
     lpips_scale: float = 1.5
@@ -49,6 +57,9 @@ class TrainConfig:
     v_scale: float = 100.0
     rnd_trans: float = 0.1
     trans_ramp: int = 10000
+    # Photometric ramps in this file are 1000 steps long. Stretch them across
+    # this many steps so JPEG and color do not jump to full strength at once.
+    distort_ramp: int = 10000
     edge_gain: float = 10.0
     edge_ramp: int = 10000
     edge_delay: int = 80000
@@ -68,9 +79,10 @@ class TrainConfig:
     jpeg_quality: float = 50.0
     jpeg_ramp: int = 1000
 
-    # Objective 3: trim up to 10% off each edge, after the message has started to stick.
+    # Objective 3: trim up to 10% off each edge. crop_start is an extra delay
+    # after the message-only phase, not a step counted from zero.
     crop_max: float = 0.10
-    crop_start: int = 1500
+    crop_start: int = 0
     crop_ramp: int = 20000
 
 
@@ -119,7 +131,7 @@ def _save_preview(path, cover, stamped, residual):
     Image.fromarray(array).save(path)
 
 
-def _checkpoint(path, step, encoder, decoder, critic, opt_g, opt_d, config):
+def _checkpoint(path, step, encoder, decoder, critic, opt_g, opt_d, config, penalty_start, bit_ema):
     torch.save(
         {
             "step": step,
@@ -129,6 +141,8 @@ def _checkpoint(path, step, encoder, decoder, critic, opt_g, opt_d, config):
             "opt_g": opt_g.state_dict(),
             "opt_d": opt_d.state_dict(),
             "config": asdict(config),
+            "penalty_start": penalty_start,
+            "bit_ema": bit_ema,
         },
         path,
     )
@@ -189,7 +203,19 @@ def run_training(config: TrainConfig):
 
     falloff = _edge_falloff().to(device)
     yuv_scales = torch.tensor([config.y_scale, config.u_scale, config.v_scale], device=device)
+    if config.no_im_loss_steps > 0:
+        print(
+            "schedule: the message is learned on the undamaged image for at least %d steps, "
+            "and until smoothed bit_acc reaches %.2f. Penalties stay off while bit_acc is lower."
+            % (config.no_im_loss_steps, config.bit_acc_goal)
+        )
+    else:
+        print("schedule: damage and image penalties ramp from step 0.")
     start = 0
+    penalty_start = None
+    bit_ema = None
+    if config.no_im_loss_steps <= 0:
+        penalty_start = 0
     if config.resume:
         checkpoint = torch.load(config.resume, map_location=device)
         encoder.load_state_dict(checkpoint["encoder"])
@@ -198,7 +224,17 @@ def run_training(config: TrainConfig):
         opt_g.load_state_dict(checkpoint["opt_g"])
         opt_d.load_state_dict(checkpoint["opt_d"])
         start = int(checkpoint["step"]) + 1
+        if config.no_im_loss_steps > 0:
+            penalty_start = checkpoint.get("penalty_start")
+            bit_ema = checkpoint.get("bit_ema")
         print("resumed at step %d" % start)
+        if penalty_start is None:
+            print(
+                "Message-only training continues until smoothed bit_acc reaches %.2f."
+                % config.bit_acc_goal
+            )
+        else:
+            print("Image penalties started at step %d." % penalty_start)
 
     log_path = save_dir / "train_log.csv"
     new_log = not log_path.exists() or start == 0
@@ -219,31 +255,52 @@ def run_training(config: TrainConfig):
                     % (tuple(cover.shape),)
                 )
             secret = torch.randint(0, 2, (cover.shape[0], config.secret_size), device=device, dtype=torch.float32)
+            message_only = penalty_start is None
+            since = 0 if message_only else step - penalty_start
 
-            trans = min(config.rnd_trans * ramp(step, config.trans_ramp), config.rnd_trans)
-            trans = random_fraction() * trans
-            shift = int(np.floor(400 * trans))
-            forward_np, inverse_np = random_homographies(cover.shape[0], 400, shift)
-            forward = torch.from_numpy(forward_np).to(device=device, dtype=cover.dtype)
-            inverse = torch.from_numpy(inverse_np).to(device=device, dtype=cover.dtype)
+            if message_only:
+                shift = 0
+            else:
+                trans = min(config.rnd_trans * ramp(since, config.trans_ramp), config.rnd_trans)
+                trans = random_fraction() * trans
+                shift = int(np.floor(400 * trans))
 
-            warped, _ = warp_cover(cover, forward)
-            residual_warped = encoder(secret, warped)
-            encoded_warped = residual_warped + warped
-            stamped = unwarp_white(encoded_warped, inverse)
-            # The residual that would be saved is the unwarped one. Previews use it.
-            residual = perspective_warp(residual_warped, inverse)
+            if shift == 0:
+                warped = cover
+                residual_warped = encoder(secret, warped)
+                encoded_warped = residual_warped + warped
+                stamped = encoded_warped
+                residual = residual_warped
+            else:
+                forward_np, inverse_np = random_homographies(cover.shape[0], 400, shift)
+                forward = torch.from_numpy(forward_np).to(device=device, dtype=cover.dtype)
+                inverse = torch.from_numpy(inverse_np).to(device=device, dtype=cover.dtype)
+                warped, _ = warp_cover(cover, forward)
+                residual_warped = encoder(secret, warped)
+                encoded_warped = residual_warped + warped
+                stamped = unwarp_white(encoded_warped, inverse)
+                # The residual that would be saved is the unwarped one. Previews use it.
+                residual = perspective_warp(residual_warped, inverse)
 
-            distorted = photometric(stamped, step, config)
+            clean_image = stamped.clamp(0, 1)
             crop_level = 0.0
-            if step >= config.crop_start:
-                crop_level = config.crop_max * ramp(step - config.crop_start, config.crop_ramp)
-            distorted = random_border_crop(distorted, crop_level)
-            logits = decoder(distorted)
-            secret_loss = F.binary_cross_entropy_with_logits(logits, secret)
+            if message_only:
+                logits = decoder(clean_image)
+                clean_logits = logits
+                secret_loss = F.binary_cross_entropy_with_logits(logits, secret)
+            else:
+                distorted = photometric(stamped, _damage_step(since, config), config)
+                if since >= config.crop_start:
+                    crop_level = config.crop_max * ramp(since - config.crop_start, config.crop_ramp)
+                distorted = random_border_crop(distorted, crop_level)
+                clean_logits = decoder(clean_image)
+                logits = decoder(distorted)
+                secret_loss = 0.5 * (
+                    F.binary_cross_entropy_with_logits(clean_logits, secret)
+                    + F.binary_cross_entropy_with_logits(logits, secret)
+                )
 
-            warmup = step < config.no_im_loss_steps
-            if warmup:
+            if message_only:
                 opt_g.zero_grad(set_to_none=True)
                 secret_loss.backward()
                 opt_g.step()
@@ -263,9 +320,9 @@ def run_training(config: TrainConfig):
                 for parameter in critic.parameters():
                     parameter.requires_grad_(False)
                 fool = critic(encoded_warped)
-                l2_w = min(config.l2_scale * step / float(config.l2_ramp), config.l2_scale)
-                lpips_w = min(config.lpips_scale * step / float(config.lpips_ramp), config.lpips_scale)
-                g_w = min(config.g_scale * step / float(config.g_ramp), config.g_scale)
+                l2_w = _ramped_weight(config.l2_scale, config.l2_ramp, since)
+                lpips_w = _ramped_weight(config.lpips_scale, config.lpips_ramp, since)
+                g_w = _ramped_weight(config.g_scale, config.g_ramp, since)
                 total = (
                     l2_w * image_loss
                     + lpips_w * perceptual
@@ -294,10 +351,21 @@ def run_training(config: TrainConfig):
             if not math_isfinite(secret_loss):
                 raise RuntimeError("secret loss became non-finite at step %d" % step)
 
+            acc_now = _bit_accuracy(clean_logits, secret)
+            bit_ema = acc_now if bit_ema is None else (0.98 * bit_ema + 0.02 * acc_now)
+            if (
+                penalty_start is None
+                and step + 1 >= config.no_im_loss_steps
+                and bit_ema >= config.bit_acc_goal
+            ):
+                penalty_start = step + 1
+                print(
+                    "smoothed bit_acc %.3f reached %.2f. Image penalties start at step %d."
+                    % (bit_ema, config.bit_acc_goal, penalty_start)
+                )
+
             if step % config.log_every == 0 or step == config.num_steps - 1:
-                with torch.no_grad():
-                    clean_logits = decoder(stamped.clamp(0, 1))
-                    clean_acc = _bit_accuracy(clean_logits, secret)
+                clean_acc = _bit_accuracy(clean_logits, secret)
                 acc = _bit_accuracy(logits, secret)
                 row = [
                     step,
@@ -316,16 +384,48 @@ def run_training(config: TrainConfig):
                     "step %d  bit_acc %.3f  clean %.3f  secret %.3f  yuv %.3f  lpips %.3f  crop %.3f"
                     % (step, acc, clean_acc, row[3], yuv_value, lpips_value, crop_level)
                 )
+                if penalty_start is None and step + 1 >= config.no_im_loss_steps:
+                    print(
+                        "penalties still off: smoothed bit_acc %.3f, goal %.2f"
+                        % (bit_ema, config.bit_acc_goal)
+                    )
 
             if step % config.save_every == 0 or step == config.num_steps - 1:
-                _checkpoint(save_dir / ("step_%06d.pt" % step), step, encoder, decoder, critic, opt_g, opt_d, config)
-                _checkpoint(save_dir / "latest.pt", step, encoder, decoder, critic, opt_g, opt_d, config)
+                _checkpoint(
+                    save_dir / ("step_%06d.pt" % step),
+                    step, encoder, decoder, critic, opt_g, opt_d, config, penalty_start, bit_ema,
+                )
+                _checkpoint(
+                    save_dir / "latest.pt",
+                    step, encoder, decoder, critic, opt_g, opt_d, config, penalty_start, bit_ema,
+                )
                 _save_preview(preview_dir / ("step_%06d.png" % step), cover, stamped, residual)
                 print("saved %s" % (save_dir / "latest.pt"))
     finally:
         log_file.close()
 
     return str(save_dir / "latest.pt")
+
+
+def _ramped_weight(scale, length, since):
+    if length <= 0:
+        return scale
+    return min(scale * since / float(length), scale)
+
+
+def _damage_step(since, config):
+    """Map training steps onto the 1000-step photometric ramps."""
+    base = max(
+        config.bri_ramp,
+        config.hue_ramp,
+        config.sat_ramp,
+        config.noise_ramp,
+        config.contrast_ramp,
+        config.jpeg_ramp,
+        1,
+    )
+    span = config.distort_ramp if config.distort_ramp > 0 else base
+    return int(since * base / float(span))
 
 
 def random_fraction():

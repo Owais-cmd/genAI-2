@@ -144,7 +144,12 @@ def photometric(image, step, cfg):
     device = image.device
     batch = image.shape[0]
 
-    blurred = F.conv2d(image, _blur_kernel(device), padding=3, groups=3)
+    blur_level = ramp(step, cfg.noise_ramp)
+    if blur_level > 0:
+        blurred = F.conv2d(image, _blur_kernel(device), padding=3, groups=3)
+        blurred = image * (1.0 - blur_level) + blurred * blur_level
+    else:
+        blurred = image
 
     noise_strength = torch.rand((), device=device) * ramp(step, cfg.noise_ramp) * cfg.noise
     noised = torch.clamp(blurred + torch.randn_like(blurred) * noise_strength, 0, 1)
